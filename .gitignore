@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# EEG raw data files (large, download separately)
+eeg_depression_detection/data/raw/
+
+# Trained model files (large)
+*.pt
+*.pth
+*.h5
+*.onnx
+eeg_depression_detection/checkpoints/
+
+# Training logs (large)
+eeg_depression_detection/training_v2.log
+eeg_depression_detection/training_log.txt
+
+# Training outputs and results (regenerable)
+eeg_depression_detection/outputs/
+eeg_depression_detection/outputs_v2/
+eeg_depression_detection/outputs_v2_parallel/
+eeg_depression_detection/explainability_results/
+eeg_depression_detection/explainability_results_v2/
+eeg_depression_detection/logs/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.lof
+*.log
+*.lot
+*.out
+*.toc
+*.nlo
+*.fls
+*.fdb_latexmk
+*.synctex.gz

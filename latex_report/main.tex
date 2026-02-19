@@ -1,0 +1,264 @@
+% ============================================================================
+% EEG-Based Depression Detection Using Deep Learning
+% A Comprehensive Project Report
+% ============================================================================
+
+\documentclass[12pt,a4paper,oneside]{report}
+
+% ============================================================================
+% PACKAGES
+% ============================================================================
+
+% Page geometry - as per specifications
+\usepackage[left=1.25in, right=0.75in, top=1in, bottom=1in]{geometry}
+
+% Font settings (Times New Roman equivalent)
+\usepackage{times}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+% Line spacing - 1.5 as specified
+\usepackage{setspace}
+\onehalfspacing
+
+% Graphics and figures
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage[labelfont=bf]{caption}
+
+% Tables
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{ragged2e}
+
+% Better table column types
+\newcolumntype{L}[1]{>{\RaggedRight\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+\newcolumntype{R}[1]{>{\RaggedLeft\arraybackslash}p{#1}}
+
+% Table row spacing
+\renewcommand{\arraystretch}{1.2}
+
+% Mathematics
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+
+% Code listings
+\usepackage{listings}
+\usepackage{xcolor}
+
+% Hyperlinks
+\usepackage[hidelinks,colorlinks=false]{hyperref}
+
+% Bibliography - numeric style with square brackets
+\usepackage[numbers,square,sort&compress]{natbib}
+
+% Algorithms
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% Chapter/Section formatting
+\usepackage{titlesec}
+
+% For list of abbreviations
+\usepackage{nomencl}
+\makenomenclature
+
+% For better enumeration
+\usepackage{enumitem}
+
+% ============================================================================
+% FORMATTING CONFIGURATION
+% ============================================================================
+
+% Chapter title: 14pt, bold, CAPS
+\titleformat{\chapter}[display]
+  {\normalfont\fontsize{14}{16}\bfseries}
+  {\MakeUppercase{\chaptertitlename}\ \thechapter}{20pt}
+  {\fontsize{14}{16}\bfseries\MakeUppercase}
+\titlespacing*{\chapter}{0pt}{-20pt}{20pt}
+
+% Section title: 13pt, bold, CAPS
+\titleformat{\section}
+  {\normalfont\fontsize{13}{15}\bfseries}
+  {\thesection}{1em}{\MakeUppercase}
+
+% Subsection title: 13pt, bold, Title Case
+\titleformat{\subsection}
+  {\normalfont\fontsize{13}{15}\bfseries}
+  {\thesubsection}{1em}{}
+
+% Subsubsection title: 12pt, bold
+\titleformat{\subsubsection}
+  {\normalfont\fontsize{12}{14}\bfseries}
+  {\thesubsubsection}{1em}{}
+
+% Figure/Table numbering as X.Y
+\usepackage{chngcntr}
+\counterwithin{figure}{chapter}
+\counterwithin{table}{chapter}
+
+% Custom figure and table naming
+\renewcommand{\figurename}{Fig}
+\renewcommand{\tablename}{Table}
+
+% Caption formatting - 10pt, title case
+\captionsetup{font=small,labelfont=bf,format=plain}
+\captionsetup[figure]{position=below}
+\captionsetup[table]{position=above}
+
+% Code listing style
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{pythonstyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2,
+    language=Python
+}
+\lstset{style=pythonstyle}
+
+% Page numbering at bottom center
+\pagestyle{plain}
+
+% ============================================================================
+% DOCUMENT CONTENT
+% ============================================================================
+
+\begin{document}
+
+% ----------------------------------------------------------------------------
+% FRONT MATTER
+% ----------------------------------------------------------------------------
+
+% Abstract
+\pagenumbering{roman}
+
+\chapter*{ABSTRACT}
+\addcontentsline{toc}{chapter}{ABSTRACT}
+
+Major Depressive Disorder (MDD) affects over 280 million people worldwide, yet diagnosis remains largely subjective, relying on clinical interviews and self-reported symptoms. This project presents an advanced deep learning system for objective depression detection from electroencephalogram (EEG) signals, addressing critical methodological flaws in existing research.
+
+We propose a novel multi-branch architecture combining a Vision Transformer for time-frequency analysis of Continuous Wavelet Transform (CWT) scalograms with a Graph Attention Network (GNN) for modeling spatial relationships between EEG electrodes. Unlike prior studies that report inflated accuracy (95-99\%) due to data leakage in cross-validation, our system employs rigorous Leave-One-Subject-Out (LOSO) validation, ensuring the model is tested on completely unseen subjects.
+
+Using the Figshare MDD EEG dataset (58 subjects, 19-channel recordings), our model achieves 91.38\% subject-level accuracy and 0.9042 AUC-ROC---clinically meaningful results that reflect true generalization capability. Multi-level explainability analysis using Integrated Gradients, Layer-wise Relevance Propagation, and Testing with Concept Activation Vectors (TCAV) confirms that the model learns established depression biomarkers including frontal alpha asymmetry, elevated theta activity, and delta abnormalities.
+
+This work demonstrates that honest evaluation methodology combined with interpretable deep learning can produce reliable, clinically relevant EEG-based depression detection systems suitable for future clinical deployment.
+
+\textbf{Keywords:} Depression Detection, EEG, Deep Learning, Transformer, Graph Neural Network, Explainable AI, LOSO Cross-Validation
+
+\newpage
+
+% Table of Contents
+\tableofcontents
+\newpage
+
+% List of Figures
+\listoffigures
+\addcontentsline{toc}{chapter}{LIST OF FIGURES}
+\newpage
+
+% List of Tables
+\listoftables
+\addcontentsline{toc}{chapter}{LIST OF TABLES}
+\newpage
+
+% List of Abbreviations
+\chapter*{LIST OF ABBREVIATIONS}
+\addcontentsline{toc}{chapter}{LIST OF ABBREVIATIONS}
+
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Abbreviation} & \textbf{Full Form} \\
+\midrule
+AUC-ROC & Area Under the Receiver Operating Characteristic Curve \\
+BDI-II & Beck Depression Inventory-II \\
+CNN & Convolutional Neural Network \\
+CWT & Continuous Wavelet Transform \\
+DL & Deep Learning \\
+DSM-5 & Diagnostic and Statistical Manual of Mental Disorders, 5th Edition \\
+EEG & Electroencephalogram \\
+FAA & Frontal Alpha Asymmetry \\
+FIR & Finite Impulse Response \\
+GAT & Graph Attention Network \\
+GNN & Graph Neural Network \\
+ICA & Independent Component Analysis \\
+IG & Integrated Gradients \\
+LOSO & Leave-One-Subject-Out \\
+LRP & Layer-wise Relevance Propagation \\
+LSTM & Long Short-Term Memory \\
+MCC & Matthews Correlation Coefficient \\
+MDD & Major Depressive Disorder \\
+MLP & Multi-Layer Perceptron \\
+PHQ-9 & Patient Health Questionnaire-9 \\
+SHAP & SHapley Additive exPlanations \\
+TCAV & Testing with Concept Activation Vectors \\
+ViT & Vision Transformer \\
+WHO & World Health Organization \\
+WPD & Wavelet Packet Decomposition \\
+XAI & Explainable Artificial Intelligence \\
+\bottomrule
+\end{tabular}
+
+\newpage
+
+% ----------------------------------------------------------------------------
+% MAIN CHAPTERS
+% ----------------------------------------------------------------------------
+\pagenumbering{arabic}
+
+% Chapter 1: Introduction
+\input{chapters/ch1_introduction}
+
+% Chapter 2: System Analysis
+\input{chapters/ch2_system_analysis}
+
+% Chapter 3: System Design
+\input{chapters/ch3_system_design}
+
+% Chapter 4: System Implementation
+\input{chapters/ch4_implementation}
+
+% Chapter 5: Conclusion and Future Scope
+\input{chapters/ch5_conclusion}
+
+% ----------------------------------------------------------------------------
+% APPENDICES
+% ----------------------------------------------------------------------------
+\appendix
+
+% Appendix A: Source Code
+\input{appendices/appendix_a_code}
+
+% Appendix B: Screenshots
+\input{appendices/appendix_b_screenshots}
+
+% ----------------------------------------------------------------------------
+% REFERENCES
+% ----------------------------------------------------------------------------
+\bibliographystyle{IEEEtranN}
+\bibliography{references}
+\addcontentsline{toc}{chapter}{REFERENCES}
+
+\end{document}

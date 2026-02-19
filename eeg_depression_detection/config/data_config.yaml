@@ -1,0 +1,76 @@
+# Data Configuration
+
+# Primary Dataset: Figshare MDD
+figshare:
+  url: "https://figshare.com/articles/dataset/EEG_Data_New/4244171"
+  data_dir: "data/raw/figshare"
+  n_subjects: 64
+  n_mdd: 34
+  n_healthy: 30
+  n_channels: 19
+  sampling_rate: 256
+  duration_sec: 300          # 5 minutes
+  conditions: ["EC", "EO"]   # Eyes Closed, Eyes Open
+
+# Secondary Dataset: Kaggle (for benchmarking)
+kaggle:
+  url: "https://www.kaggle.com/datasets/tocodeforsoul/depression-rest-eeg-features"
+  data_dir: "data/raw/kaggle"
+  n_subjects: 232
+  n_features: 31
+  note: "Pre-extracted features only"
+
+# Preprocessing
+preprocessing:
+  target_sampling_rate: 250  # Resample to this rate
+  bandpass:
+    low: 1
+    high: 45
+  notch:
+    freqs: [50, 60]         # Power line noise (50Hz EU, 60Hz US)
+  filter_order: 101
+  ica:
+    method: "picard"
+    n_components: 0.99       # Variance explained
+    max_iter: 500
+  reference: "average"
+
+# Segmentation
+segmentation:
+  epoch_length_sec: 4.0
+  overlap_ratio: 0.5         # 50% overlap
+  min_epochs_per_subject: 10
+
+# 10-20 Electrode Montage
+electrodes:
+  names: ["Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8",
+          "T3", "C3", "Cz", "C4", "T4",
+          "T5", "P3", "Pz", "P4", "T6",
+          "O1", "O2"]
+  # Standard 10-20 3D positions (normalized)
+  positions:
+    Fp1: [-0.31, 0.95, -0.03]
+    Fp2: [0.31, 0.95, -0.03]
+    F7: [-0.81, 0.59, -0.03]
+    F3: [-0.55, 0.67, 0.50]
+    Fz: [0.00, 0.71, 0.70]
+    F4: [0.55, 0.67, 0.50]
+    F8: [0.81, 0.59, -0.03]
+    T3: [-1.00, 0.00, -0.03]
+    C3: [-0.71, 0.00, 0.71]
+    Cz: [0.00, 0.00, 1.00]
+    C4: [0.71, 0.00, 0.71]
+    T4: [1.00, 0.00, -0.03]
+    T5: [-0.81, -0.59, -0.03]
+    P3: [-0.55, -0.67, 0.50]
+    Pz: [0.00, -0.71, 0.70]
+    P4: [0.55, -0.67, 0.50]
+    T6: [0.81, -0.59, -0.03]
+    O1: [-0.31, -0.95, -0.03]
+    O2: [0.31, -0.95, -0.03]
+
+# Graph Construction
+graph:
+  spatial_k_neighbors: 6     # K-nearest neighbors for spatial adjacency
+  functional_threshold: 0.5  # Correlation threshold for functional connectivity
+  combine_method: "union"    # How to combine spatial and functional edges
