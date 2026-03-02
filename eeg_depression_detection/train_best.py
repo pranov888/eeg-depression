@@ -555,7 +555,7 @@ def run_loso_cv(all_subjects: dict):
     log.info(f"Device: {DEVICE}")
     if DEVICE.type == "cuda":
         log.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        log.info(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        log.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     subject_ids = sorted(all_subjects.keys())
     n_subjects = len(subject_ids)
