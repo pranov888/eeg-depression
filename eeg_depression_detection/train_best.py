@@ -7,7 +7,7 @@ trains a 3-model ensemble (1D-CNN + XGBoost + SVM) with LOSO CV,
 and reports sample-level + subject-level metrics.
 
 Usage:
-    conda run -n eeg_dep python train_best.py
+    python train_best.py
 """
 
 import os
@@ -81,13 +81,28 @@ CNN_BATCH = 32
 CNN_LR = 1e-3
 CNN_PATIENCE = 7
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
+
+# ---------------------------------------------------------------------------
+# Device setup — detect CUDA compatibility properly
+# ---------------------------------------------------------------------------
+def get_device():
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    try:
+        # Test if CUDA actually works by doing a small operation
+        t = torch.zeros(1, device="cuda")
+        _ = t + 1
+        return torch.device("cuda")
+    except Exception:
+        return torch.device("cpu")
+
+DEVICE = get_device()
 
 # Reproducibility
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-if torch.cuda.is_available():
+if DEVICE.type == "cuda":
     torch.cuda.manual_seed_all(SEED)
 
 # ---------------------------------------------------------------------------
@@ -271,7 +286,6 @@ def extract_temporal_features(epoch: np.ndarray):
     features = []
     for ch in range(epoch.shape[0]):
         x = epoch[ch]
-        # Basic stats
         feat = [
             np.mean(x),
             np.var(x),
@@ -312,9 +326,7 @@ def extract_wavelet_features(epoch: np.ndarray):
 
 
 def extract_connectivity_features(epoch: np.ndarray, sr: int = TARGET_SR):
-    """Inter-channel coherence in alpha and beta bands.
-    epoch: (n_channels, n_samples). Returns upper-triangle coherence values.
-    """
+    """Inter-channel coherence in alpha and beta bands."""
     bands_of_interest = {"alpha": (8, 13), "beta": (13, 30)}
     features = []
     n_ch = epoch.shape[0]
@@ -350,42 +362,47 @@ def extract_features_batch(epochs: np.ndarray):
 
 
 # ===========================================================================
-# 3. DATA AUGMENTATION
+# 3. DATA AUGMENTATION (feature-space — avoids re-extracting from EEG)
 # ===========================================================================
 
-def augment_epoch(epoch: np.ndarray, rng: np.random.RandomState):
-    """Apply random augmentations to a single epoch (n_channels, n_samples)."""
-    aug = epoch.copy()
-
-    # Time shift (±10%)
-    if rng.random() < 0.5:
-        shift = rng.randint(-int(0.1 * aug.shape[1]), int(0.1 * aug.shape[1]))
-        aug = np.roll(aug, shift, axis=1)
-
-    # Gaussian noise injection (SNR ~20dB)
-    if rng.random() < 0.5:
-        noise_power = np.mean(aug ** 2) / (10 ** (20 / 10))
-        noise = rng.normal(0, np.sqrt(noise_power + 1e-12), aug.shape)
-        aug = aug + noise
-
-    # Channel dropout
-    if rng.random() < 0.3:
-        drop_ch = rng.randint(0, aug.shape[0])
-        aug[drop_ch] = 0.0
-
+def augment_features(features: np.ndarray, rng: np.random.RandomState):
+    """Augment in feature space: add small Gaussian noise + random scaling.
+    Much faster than augmenting raw EEG and re-extracting features.
+    features: (n_samples, n_features)
+    Returns: augmented copy (n_samples, n_features)
+    """
+    aug = features.copy()
+    # Gaussian noise (1% of feature std per column)
+    noise_scale = 0.01 * (np.std(aug, axis=0, keepdims=True) + 1e-10)
+    aug += rng.normal(0, 1, aug.shape) * noise_scale
+    # Random scaling per-sample (0.95 to 1.05)
+    scale = rng.uniform(0.95, 1.05, size=(aug.shape[0], 1))
+    aug *= scale
     return aug
 
 
-def augment_epochs(epochs: np.ndarray, n_augmented: int = 1):
-    """Create augmented copies of epochs.
-    Returns original + augmented epochs concatenated.
+def augment_epochs_raw(epochs: np.ndarray, rng: np.random.RandomState):
+    """Augment raw EEG epochs for CNN training.
+    Returns augmented copy (same shape as input).
     """
-    rng = np.random.RandomState(SEED)
     augmented = []
-    for _ in range(n_augmented):
-        for i in range(len(epochs)):
-            augmented.append(augment_epoch(epochs[i], rng))
-    return np.concatenate([epochs, np.array(augmented)], axis=0)
+    for i in range(len(epochs)):
+        aug = epochs[i].copy()
+        # Time shift (±10%)
+        if rng.random() < 0.5:
+            shift = rng.randint(-int(0.1 * aug.shape[1]), int(0.1 * aug.shape[1]))
+            aug = np.roll(aug, shift, axis=1)
+        # Gaussian noise (SNR ~20dB)
+        if rng.random() < 0.5:
+            noise_power = np.mean(aug ** 2) / (10 ** (20 / 10))
+            noise = rng.normal(0, np.sqrt(noise_power + 1e-12), aug.shape)
+            aug = aug + noise
+        # Channel dropout
+        if rng.random() < 0.3:
+            drop_ch = rng.randint(0, aug.shape[0])
+            aug[drop_ch] = 0.0
+        augmented.append(aug)
+    return np.array(augmented)
 
 
 # ===========================================================================
@@ -441,7 +458,8 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=CNN_LR, weight_decay=0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CNN_EPOCHS)
-    scaler = GradScaler("cuda") if DEVICE.type == "cuda" else None
+    use_amp = DEVICE.type == "cuda"
+    scaler = GradScaler("cuda") if use_amp else None
 
     # Create dataloaders
     X_train = torch.FloatTensor(train_epochs)
@@ -452,9 +470,9 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
     train_ds = TensorDataset(X_train, y_train)
     val_ds = TensorDataset(X_val, y_val)
     train_loader = DataLoader(train_ds, batch_size=CNN_BATCH, shuffle=True,
-                              pin_memory=True, num_workers=0)
+                              pin_memory=(DEVICE.type == "cuda"), num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=CNN_BATCH, shuffle=False,
-                            pin_memory=True, num_workers=0)
+                            pin_memory=(DEVICE.type == "cuda"), num_workers=0)
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -469,7 +487,7 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
             y_batch = y_batch.to(DEVICE).unsqueeze(1)
 
             optimizer.zero_grad()
-            if scaler is not None:
+            if use_amp:
                 with autocast("cuda"):
                     logits = model(X_batch)
                     loss = criterion(logits, y_batch)
@@ -496,7 +514,7 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
             for X_batch, y_batch in val_loader:
                 X_batch = X_batch.to(DEVICE)
                 y_batch = y_batch.to(DEVICE).unsqueeze(1)
-                if scaler is not None:
+                if use_amp:
                     with autocast("cuda"):
                         logits = model(X_batch)
                         loss = criterion(logits, y_batch)
@@ -528,12 +546,14 @@ def predict_cnn(model, epochs_data):
     model.eval()
     X = torch.FloatTensor(epochs_data)
     ds = TensorDataset(X)
-    loader = DataLoader(ds, batch_size=CNN_BATCH, shuffle=False, pin_memory=True)
+    loader = DataLoader(ds, batch_size=CNN_BATCH, shuffle=False,
+                        pin_memory=(DEVICE.type == "cuda"))
+    use_amp = DEVICE.type == "cuda"
     probs = []
     with torch.no_grad():
         for (X_batch,) in loader:
             X_batch = X_batch.to(DEVICE)
-            if DEVICE.type == "cuda":
+            if use_amp:
                 with autocast("cuda"):
                     logits = model(X_batch)
             else:
@@ -548,7 +568,13 @@ def predict_cnn(model, epochs_data):
 # ===========================================================================
 
 def run_loso_cv(all_subjects: dict):
-    """Run Leave-One-Subject-Out CV with 3-model ensemble."""
+    """Run Leave-One-Subject-Out CV with 3-model ensemble.
+
+    Strategy for speed:
+    - Extract handcrafted features ONCE for all subjects (pre-computed)
+    - Augment in feature-space (add noise/scale) — no re-extraction needed
+    - Augment raw EEG for CNN only (fast numpy ops, no feature extraction)
+    """
     log.info("\n" + "=" * 60)
     log.info("LOSO CROSS-VALIDATION — ENSEMBLE (CNN + XGBoost + SVM)")
     log.info("=" * 60)
@@ -556,22 +582,34 @@ def run_loso_cv(all_subjects: dict):
     if DEVICE.type == "cuda":
         log.info(f"GPU: {torch.cuda.get_device_name(0)}")
         log.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        log.info("Running CNN on CPU (no compatible CUDA device)")
 
     subject_ids = sorted(all_subjects.keys())
     n_subjects = len(subject_ids)
 
-    # Pre-extract features for all subjects (to avoid repeated computation)
+    # ---- Pre-extract features for ALL subjects ONCE ----
     log.info("\nExtracting handcrafted features for all subjects...")
     t0 = time.time()
     subject_features = {}
-    for sid in subject_ids:
+    for idx, sid in enumerate(subject_ids):
         epochs = all_subjects[sid]["epochs"]
         feats = extract_features_batch(epochs)
         subject_features[sid] = feats
-        log.info(f"  {sid}: {feats.shape[0]} epochs, {feats.shape[1]} features")
+        log.info(f"  [{idx+1}/{n_subjects}] {sid}: {feats.shape[0]} epochs, {feats.shape[1]} features")
 
     feat_dim = subject_features[subject_ids[0]].shape[1]
     log.info(f"Feature extraction done in {time.time() - t0:.1f}s. Feature dim: {feat_dim}")
+
+    # ---- Pre-compute augmented features (feature-space augmentation) ----
+    log.info("\nAugmenting features in feature-space (fast)...")
+    t0 = time.time()
+    rng = np.random.RandomState(SEED)
+    subject_features_aug = {}
+    for sid in subject_ids:
+        aug = augment_features(subject_features[sid], rng)
+        subject_features_aug[sid] = aug
+    log.info(f"Feature augmentation done in {time.time() - t0:.1f}s")
 
     # Storage for predictions
     all_epoch_labels = []
@@ -584,38 +622,47 @@ def run_loso_cv(all_subjects: dict):
     subject_true = {}
     subject_pred_prob = {}
 
+    log.info(f"\nStarting {n_subjects}-fold LOSO CV...")
+    total_t0 = time.time()
+
     for fold_idx, test_sid in enumerate(subject_ids):
+        fold_t0 = time.time()
         test_label = all_subjects[test_sid]["label"]
         test_epochs = all_subjects[test_sid]["epochs"]
         test_feats = subject_features[test_sid]
 
         # Gather training data
         train_sids = [s for s in subject_ids if s != test_sid]
-        train_epochs_list = []
-        train_labels_list = []
+
+        # --- Build training features (original + augmented, all pre-computed) ---
         train_feats_list = []
         train_feat_labels = []
+        train_epochs_list = []
+        train_epoch_labels = []
+
+        rng_fold = np.random.RandomState(SEED + fold_idx)
 
         for sid in train_sids:
-            ep = all_subjects[sid]["epochs"]
             lab = all_subjects[sid]["label"]
-            ft = subject_features[sid]
-            n_ep = ep.shape[0]
+            ft_orig = subject_features[sid]
+            ft_aug = subject_features_aug[sid]
+            ep_orig = all_subjects[sid]["epochs"]
 
-            # Augment training data
-            ep_aug = augment_epochs(ep, n_augmented=1)  # 2x data
-            ft_aug = extract_features_batch(ep_aug[n_ep:])  # Features for augmented only
-            ft_combined = np.concatenate([ft, ft_aug], axis=0)
+            # Features: original + augmented
+            train_feats_list.append(ft_orig)
+            train_feats_list.append(ft_aug)
+            train_feat_labels.append(np.full(len(ft_orig) + len(ft_aug), lab, dtype=np.float32))
 
+            # Raw epochs for CNN: original + augmented
+            ep_aug = augment_epochs_raw(ep_orig, rng_fold)
+            train_epochs_list.append(ep_orig)
             train_epochs_list.append(ep_aug)
-            train_labels_list.append(np.full(len(ep_aug), lab, dtype=np.float32))
-            train_feats_list.append(ft_combined)
-            train_feat_labels.append(np.full(len(ft_combined), lab, dtype=np.float32))
+            train_epoch_labels.append(np.full(len(ep_orig) + len(ep_aug), lab, dtype=np.float32))
 
-        train_epochs_all = np.concatenate(train_epochs_list, axis=0)
-        train_labels_all = np.concatenate(train_labels_list, axis=0)
         train_feats_all = np.concatenate(train_feats_list, axis=0)
         train_feat_labels_all = np.concatenate(train_feat_labels, axis=0)
+        train_epochs_all = np.concatenate(train_epochs_list, axis=0)
+        train_epoch_labels_all = np.concatenate(train_epoch_labels, axis=0)
 
         # Handle NaN/Inf in features
         train_feats_all = np.nan_to_num(train_feats_all, nan=0.0, posinf=0.0, neginf=0.0)
@@ -628,13 +675,16 @@ def run_loso_cv(all_subjects: dict):
 
         # --- Model A: 1D-CNN ---
         cnn_model = train_cnn(
-            train_epochs_all, train_labels_all,
+            train_epochs_all, train_epoch_labels_all,
             test_epochs, np.full(len(test_epochs), test_label, dtype=np.float32),
         )
         cnn_probs = predict_cnn(cnn_model, test_epochs)
         del cnn_model
         if DEVICE.type == "cuda":
             torch.cuda.empty_cache()
+
+        # Free large arrays
+        del train_epochs_all, train_epoch_labels_all
 
         # --- Model B: XGBoost ---
         n_pos = np.sum(train_feat_labels_all == 1)
@@ -681,6 +731,10 @@ def run_loso_cv(all_subjects: dict):
         all_epoch_probs_svm.extend(svm_probs.tolist())
         all_epoch_subject_ids.extend([test_sid] * n_test)
 
+        fold_time = time.time() - fold_t0
+        elapsed = time.time() - total_t0
+        eta = (elapsed / (fold_idx + 1)) * (n_subjects - fold_idx - 1)
+
         status = "CORRECT" if subj_pred == test_label else "WRONG"
         label_str = "MDD" if test_label == 1 else "H"
         pred_str = "MDD" if subj_pred == 1 else "H"
@@ -689,7 +743,7 @@ def run_loso_cv(all_subjects: dict):
             f"True={label_str:3s} Pred={pred_str:3s} "
             f"prob={subj_prob:.3f} "
             f"(CNN={np.mean(cnn_probs):.3f} XGB={np.mean(xgb_probs):.3f} SVM={np.mean(svm_probs):.3f}) "
-            f"[{status}]"
+            f"[{status}] {fold_time:.0f}s (ETA: {eta/60:.0f}min)"
         )
 
     return compute_and_report_metrics(
