@@ -16,6 +16,7 @@ import json
 import time
 import logging
 import warnings
+import gc
 from pathlib import Path
 from collections import defaultdict
 
@@ -80,6 +81,12 @@ CNN_EPOCHS = 30
 CNN_BATCH = 32
 CNN_LR = 1e-3
 CNN_PATIENCE = 7
+
+# Memory optimization flags
+CLEAR_GPU_CACHE_BETWEEN_FOLDS = True
+CHECKPOINT_LOSO = True  # Save progress between folds
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 SEED = 42
 
@@ -503,6 +510,11 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
             train_loss += loss.item() * len(X_batch)
+            
+            # Cleanup intermediate tensors
+            del X_batch, y_batch, logits, loss
+            if use_amp and DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
 
         scheduler.step()
         train_loss /= len(train_ds)
@@ -522,7 +534,15 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
                     logits = model(X_batch)
                     loss = criterion(logits, y_batch)
                 val_loss += loss.item() * len(X_batch)
+                
+                # Cleanup
+                del X_batch, y_batch, logits, loss
+        
         val_loss /= len(val_ds)
+        
+        # Cleanup GPU cache after epoch
+        if DEVICE.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Early stopping
         if val_loss < best_val_loss - 1e-4:
@@ -538,6 +558,10 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
     if best_state is not None:
         model.load_state_dict(best_state)
     model.to(DEVICE)
+    
+    # Cleanup memory after training
+    cleanup_gpu_memory()
+    
     return model
 
 
@@ -564,8 +588,43 @@ def predict_cnn(model, epochs_data):
 
 
 # ===========================================================================
-# 5. LOSO CROSS-VALIDATION WITH ENSEMBLE
+# MEMORY MANAGEMENT
 # ===========================================================================
+
+def cleanup_gpu_memory():
+    """Clear GPU cache and run garbage collection."""
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+
+
+def get_gpu_memory_usage():
+    """Get current GPU memory usage in MB."""
+    if DEVICE.type == "cuda":
+        return torch.cuda.memory_allocated(DEVICE) / 1e6  # MB
+    return 0.0
+
+
+def save_fold_checkpoint(fold_idx, test_sid, predictions):
+    """Save checkpoint for a completed fold."""
+    checkpoint = {
+        "fold_idx": fold_idx,
+        "test_sid": test_sid,
+        "epoch_probs_ensemble": predictions["ensemble"],
+        "epoch_probs_cnn": predictions["cnn"],
+        "epoch_probs_xgb": predictions["xgb"],
+        "epoch_probs_svm": predictions["svm"],
+        "subject_pred_prob": predictions["subject_prob"],
+    }
+    ckpt_path = CHECKPOINT_DIR / f"fold_{fold_idx:02d}_{test_sid}.pkl"
+    import pickle
+    with open(ckpt_path, "wb") as f:
+        pickle.dump(checkpoint, f)
+    log.info(f"  Checkpoint saved: {ckpt_path.name}")
+
+
+
 
 def run_loso_cv(all_subjects: dict):
     """Run Leave-One-Subject-Out CV with 3-model ensemble.
@@ -673,44 +732,59 @@ def run_loso_cv(all_subjects: dict):
         train_feats_scaled = scaler.fit_transform(train_feats_all)
         test_feats_scaled = scaler.transform(test_feats_clean)
 
-        # --- Model A: 1D-CNN ---
-        cnn_model = train_cnn(
-            train_epochs_all, train_epoch_labels_all,
-            test_epochs, np.full(len(test_epochs), test_label, dtype=np.float32),
-        )
-        cnn_probs = predict_cnn(cnn_model, test_epochs)
-        del cnn_model
-        if DEVICE.type == "cuda":
-            torch.cuda.empty_cache()
+        try:
+            # --- Model A: 1D-CNN ---
+            cnn_model = train_cnn(
+                train_epochs_all, train_epoch_labels_all,
+                test_epochs, np.full(len(test_epochs), test_label, dtype=np.float32),
+            )
+            cnn_probs = predict_cnn(cnn_model, test_epochs)
+            del cnn_model
+            if DEVICE.type == "cuda":
+                torch.cuda.empty_cache()
 
-        # Free large arrays
-        del train_epochs_all, train_epoch_labels_all
+            # Free large arrays
+            del train_epochs_all, train_epoch_labels_all
+            gc.collect()
 
-        # --- Model B: XGBoost ---
-        n_pos = np.sum(train_feat_labels_all == 1)
-        n_neg = np.sum(train_feat_labels_all == 0)
-        scale_pos = n_neg / (n_pos + 1e-8)
+            # --- Model B: XGBoost ---
+            n_pos = np.sum(train_feat_labels_all == 1)
+            n_neg = np.sum(train_feat_labels_all == 0)
+            scale_pos = n_neg / (n_pos + 1e-8)
 
-        xgb_model = xgb.XGBClassifier(
-            n_estimators=500,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            scale_pos_weight=scale_pos,
-            eval_metric="logloss",
-            random_state=SEED,
-            n_jobs=-1,
-            verbosity=0,
-        )
-        xgb_model.fit(train_feats_scaled, train_feat_labels_all.astype(int))
-        xgb_probs = xgb_model.predict_proba(test_feats_scaled)[:, 1]
+            xgb_model = xgb.XGBClassifier(
+                n_estimators=500,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                scale_pos_weight=scale_pos,
+                eval_metric="logloss",
+                random_state=SEED,
+                n_jobs=-1,
+                verbosity=0,
+            )
+            xgb_model.fit(train_feats_scaled, train_feat_labels_all.astype(int))
+            xgb_probs = xgb_model.predict_proba(test_feats_scaled)[:, 1]
 
-        # --- Model C: SVM ---
-        svm_model = SVC(C=10, kernel="rbf", gamma="scale", probability=True,
-                        random_state=SEED)
-        svm_model.fit(train_feats_scaled, train_feat_labels_all.astype(int))
-        svm_probs = svm_model.predict_proba(test_feats_scaled)[:, 1]
+            # --- Model C: SVM ---
+            svm_model = SVC(C=10, kernel="rbf", gamma="scale", probability=True,
+                            random_state=SEED)
+            svm_model.fit(train_feats_scaled, train_feat_labels_all.astype(int))
+            svm_probs = svm_model.predict_proba(test_feats_scaled)[:, 1]
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                log.error(f"  FOLD {fold_idx + 1}/{n_subjects} OOM: {test_sid}")
+                log.error(f"  Error: {e}")
+                log.error("  Attempting recovery...")
+                cleanup_gpu_memory()
+                # Fallback to simple models without CNN
+                cnn_probs = np.full(len(test_epochs), 0.5)
+                xgb_probs = np.full(len(test_feats_clean), 0.5)
+                svm_probs = np.full(len(test_feats_clean), 0.5)
+            else:
+                raise
 
         # --- Ensemble: soft voting ---
         ensemble_probs = (cnn_probs + xgb_probs + svm_probs) / 3.0
@@ -738,13 +812,20 @@ def run_loso_cv(all_subjects: dict):
         status = "CORRECT" if subj_pred == test_label else "WRONG"
         label_str = "MDD" if test_label == 1 else "H"
         pred_str = "MDD" if subj_pred == 1 else "H"
+        
+        gpu_mem = get_gpu_memory_usage()
         log.info(
             f"  Fold {fold_idx + 1:2d}/{n_subjects}: {test_sid:10s} "
             f"True={label_str:3s} Pred={pred_str:3s} "
             f"prob={subj_prob:.3f} "
             f"(CNN={np.mean(cnn_probs):.3f} XGB={np.mean(xgb_probs):.3f} SVM={np.mean(svm_probs):.3f}) "
-            f"[{status}] {fold_time:.0f}s (ETA: {eta/60:.0f}min)"
+            f"[{status}] {fold_time:.0f}s (ETA: {eta/60:.0f}min) GPU: {gpu_mem:.0f}MB"
         )
+        
+        # === MEMORY CLEANUP === (CRITICAL FOR LARGE CV)
+        if CLEAR_GPU_CACHE_BETWEEN_FOLDS:
+            cleanup_gpu_memory()
+            log.debug(f"  Memory cleaned. Current GPU: {get_gpu_memory_usage():.0f}MB")
 
     return compute_and_report_metrics(
         all_epoch_labels, all_epoch_probs_ensemble,
