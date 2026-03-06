@@ -17,6 +17,7 @@ import time
 import logging
 import warnings
 import gc
+import pickle
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -89,6 +90,14 @@ CLEAR_GPU_CACHE_BETWEEN_FOLDS = True
 CHECKPOINT_LOSO = True  # Save progress between folds
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
+
+# SVM: cap training samples to keep it tractable (RBF SVM is O(n^2))
+# 70k samples would take 30-60min/fold = 48+ hours total. Cap at 10k.
+SVM_MAX_TRAIN_SAMPLES = 10000
+
+# Directory to save trained models
+MODELS_DIR = OUTPUT_DIR / "models"
+MODELS_DIR.mkdir(exist_ok=True)
 
 SEED = 42
 
@@ -654,12 +663,78 @@ def save_fold_checkpoint(fold_idx, test_sid, predictions):
         "epoch_probs_xgb": predictions["xgb"],
         "epoch_probs_svm": predictions["svm"],
         "subject_pred_prob": predictions["subject_prob"],
+        "subject_true_label": predictions["subject_true_label"],
+        "timestamp": datetime.now().isoformat(),
     }
     ckpt_path = CHECKPOINT_DIR / f"fold_{fold_idx:02d}_{test_sid}.pkl"
-    import pickle
     with open(ckpt_path, "wb") as f:
         pickle.dump(checkpoint, f)
-    log.info(f"  Checkpoint saved: {ckpt_path.name}")
+    log.debug(f"  Checkpoint saved: {ckpt_path.name}")
+
+
+def save_running_results(subject_true, subject_pred_prob, fold_idx, n_subjects):
+    """Save partial results after each fold so progress is never lost."""
+    subject_ids_sorted = sorted(subject_true.keys())
+    subj_true_arr = np.array([subject_true[s] for s in subject_ids_sorted])
+    subj_prob_arr = np.array([subject_pred_prob[s] for s in subject_ids_sorted])
+    subj_pred_arr = (subj_prob_arr >= 0.5).astype(int)
+
+    if len(np.unique(subj_true_arr)) < 2:
+        # Not enough classes yet for AUC
+        partial = {
+            "status": "in_progress",
+            "folds_completed": fold_idx + 1,
+            "folds_total": n_subjects,
+            "per_subject_probabilities": {
+                sid: {
+                    "true_label": int(subject_true[sid]),
+                    "pred_prob": float(subject_pred_prob[sid]),
+                    "predicted": int(subject_pred_prob[sid] >= 0.5),
+                }
+                for sid in subject_ids_sorted
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
+    else:
+        running_acc = accuracy_score(subj_true_arr, subj_pred_arr)
+        partial = {
+            "status": "in_progress",
+            "folds_completed": fold_idx + 1,
+            "folds_total": n_subjects,
+            "running_subject_accuracy": float(running_acc),
+            "running_correct": int(np.sum(subj_true_arr == subj_pred_arr)),
+            "per_subject_probabilities": {
+                sid: {
+                    "true_label": int(subject_true[sid]),
+                    "pred_prob": float(subject_pred_prob[sid]),
+                    "predicted": int(subject_pred_prob[sid] >= 0.5),
+                }
+                for sid in subject_ids_sorted
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    partial_path = OUTPUT_DIR / "results_partial.json"
+    with open(partial_path, "w") as f:
+        json.dump(partial, f, indent=2)
+
+
+def save_models(cnn_model, xgb_model, svm_model, scaler, fold_idx, test_sid):
+    """Save all three trained models for a given fold."""
+    fold_dir = MODELS_DIR / f"fold_{fold_idx:02d}_{test_sid}"
+    fold_dir.mkdir(exist_ok=True)
+
+    # Save CNN
+    torch.save(cnn_model.state_dict(), fold_dir / "cnn_weights.pt")
+
+    # Save XGBoost
+    xgb_model.save_model(str(fold_dir / "xgboost.json"))
+
+    # Save SVM + scaler together
+    with open(fold_dir / "svm_and_scaler.pkl", "wb") as f:
+        pickle.dump({"svm": svm_model, "scaler": scaler}, f)
+
+    log.debug(f"  Models saved: {fold_dir.name}")
 
 
 
@@ -828,19 +903,30 @@ def run_loso_cv(all_subjects: dict):
             model_times["xgb"].append(xgb_time)
             log.debug(f"    XGBoost: {xgb_time:.1f}s")
 
-            # --- Model C: SVM ---
+            # --- Model C: SVM (subsampled to avoid >48hr runtime) ---
             svm_t0 = time.time()
             svm_model = SVC(C=10, kernel="rbf", gamma="scale", probability=True,
                             random_state=SEED)
-            svm_model.fit(train_feats_scaled, train_feat_labels_all.astype(int))
+            n_svm_train = len(train_feats_scaled)
+            if n_svm_train > SVM_MAX_TRAIN_SAMPLES:
+                rng_svm = np.random.RandomState(SEED + fold_idx)
+                svm_idx = rng_svm.choice(n_svm_train, SVM_MAX_TRAIN_SAMPLES, replace=False)
+                svm_train_X = train_feats_scaled[svm_idx]
+                svm_train_y = train_feat_labels_all.astype(int)[svm_idx]
+                log.debug(f"    SVM subsampled: {n_svm_train} → {SVM_MAX_TRAIN_SAMPLES}")
+            else:
+                svm_train_X = train_feats_scaled
+                svm_train_y = train_feat_labels_all.astype(int)
+            svm_model.fit(svm_train_X, svm_train_y)
             svm_probs = svm_model.predict_proba(test_feats_scaled)[:, 1]
             svm_time = time.time() - svm_t0
             model_times["svm"].append(svm_time)
             log.debug(f"    SVM: {svm_time:.1f}s")
 
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                log.error(f"  Fold {fold_idx + 1}/{n_subjects} OOM on {test_sid}")
+        except (RuntimeError, MemoryError) as e:
+            err_str = str(e).lower()
+            if "out of memory" in err_str or "memory" in err_str or isinstance(e, MemoryError):
+                log.error(f"  Fold {fold_idx + 1}/{n_subjects} OOM/MemError on {test_sid}")
                 log.error(f"  Error: {e}")
                 log.error("  Attempting recovery...")
                 cleanup_gpu_memory()
@@ -848,6 +934,8 @@ def run_loso_cv(all_subjects: dict):
                 cnn_probs = np.full(len(test_epochs), 0.5)
                 xgb_probs = np.full(len(test_feats_clean), 0.5)
                 svm_probs = np.full(len(test_feats_clean), 0.5)
+                xgb_model = None
+                svm_model = None
             else:
                 raise
 
@@ -895,8 +983,36 @@ def run_loso_cv(all_subjects: dict):
             f"    Model probs - CNN={np.mean(cnn_probs):.3f}, "
             f"XGB={np.mean(xgb_probs):.3f}, SVM={np.mean(svm_probs):.3f}"
         )
-        
-        # === MEMORY CLEANUP === (CRITICAL FOR LARGE CV)
+
+        # === SAVE FOLD CHECKPOINT (raw per-fold data) ===
+        if CHECKPOINT_LOSO:
+            CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+            save_fold_checkpoint(fold_idx, test_sid, {
+                "ensemble": ensemble_probs.tolist(),
+                "cnn": cnn_probs.tolist(),
+                "xgb": xgb_probs.tolist(),
+                "svm": svm_probs.tolist(),
+                "subject_prob": float(subj_prob),
+                "subject_true_label": int(test_label),
+            })
+
+        # === SAVE MODELS FOR THIS FOLD ===
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        if xgb_model is not None and svm_model is not None:
+            save_models(cnn_model, xgb_model, svm_model, scaler, fold_idx, test_sid)
+
+        # === SAVE RUNNING PARTIAL RESULTS (crash-safe) ===
+        save_running_results(subject_true, subject_pred_prob, fold_idx, n_subjects)
+
+        # === FREE MODEL MEMORY (64 folds × large models = RAM leak) ===
+        del cnn_model
+        if xgb_model is not None:
+            del xgb_model
+        if svm_model is not None:
+            del svm_model
+        gc.collect()
+
+        # === GPU CACHE CLEANUP ===
         if CLEAR_GPU_CACHE_BETWEEN_FOLDS:
             cleanup_gpu_memory()
             log.debug(f"    Post-cleanup GPU memory: {get_gpu_memory_usage():.0f}MB")
@@ -906,12 +1022,13 @@ def run_loso_cv(all_subjects: dict):
     log.info(f"  Avg fold time: {np.mean(fold_times):.1f}s")
     log.info(f"  Total folds: {len(fold_times)}")
 
-    return compute_and_report_metrics(
+    metrics = compute_and_report_metrics(
         all_epoch_labels, all_epoch_probs_ensemble,
         all_epoch_probs_cnn, all_epoch_probs_xgb, all_epoch_probs_svm,
         all_epoch_subject_ids, subject_true, subject_pred_prob,
         model_times=model_times,
     )
+    return metrics, subject_features, subject_features_aug
 
 
 # ===========================================================================
@@ -1086,6 +1203,109 @@ def compute_and_report_metrics(
 # MAIN
 # ===========================================================================
 
+def train_final_model(all_subjects: dict, subject_features: dict, subject_features_aug: dict):
+    """Train final ensemble models on ALL subjects and save for deployment.
+
+    This produces the actual deployable model, separate from LOSO CV folds.
+    Uses the already-computed subject_features / subject_features_aug so no
+    additional feature extraction time is needed.
+    """
+    log.info("\n" + "=" * 60)
+    log.info("PHASE 4: FINAL MODEL TRAINING (ALL SUBJECTS)")
+    log.info("=" * 60)
+
+    subject_ids = sorted(all_subjects.keys())
+    rng = np.random.RandomState(SEED)
+
+    # Concatenate features from all subjects (original + augmented)
+    all_feats = []
+    all_labels = []
+    for sid in subject_ids:
+        label = all_subjects[sid]["label"]
+        feats = subject_features[sid]
+        feats_aug = subject_features_aug[sid]
+        all_feats.append(feats)
+        all_labels.extend([label] * len(feats))
+        all_feats.append(feats_aug)
+        all_labels.extend([label] * len(feats_aug))
+
+    all_feats = np.vstack(all_feats)
+    all_labels = np.array(all_labels, dtype=int)
+
+    # Scale features
+    scaler = StandardScaler()
+    all_feats_scaled = scaler.fit_transform(all_feats)
+
+    log.info(f"  Training on {len(all_labels):,} samples ({int(all_labels.sum())} MDD, {int((1-all_labels).sum())} H)")
+
+    # --- Model B: XGBoost (all data) ---
+    log.info("  Training XGBoost (all subjects)...")
+    xgb_t0 = time.time()
+    xgb_final = xgb.XGBClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        use_label_encoder=False, eval_metric="logloss",
+        random_state=SEED,
+    )
+    xgb_final.fit(all_feats_scaled, all_labels)
+    log.info(f"  ✓ XGBoost done in {time.time()-xgb_t0:.1f}s")
+
+    # --- Model C: SVM (subsampled) ---
+    log.info(f"  Training SVM (subsampled to {SVM_MAX_TRAIN_SAMPLES}) ...")
+    svm_t0 = time.time()
+    if len(all_feats_scaled) > SVM_MAX_TRAIN_SAMPLES:
+        svm_idx = rng.choice(len(all_feats_scaled), SVM_MAX_TRAIN_SAMPLES, replace=False)
+        svm_X = all_feats_scaled[svm_idx]
+        svm_y = all_labels[svm_idx]
+    else:
+        svm_X, svm_y = all_feats_scaled, all_labels
+    svm_final = SVC(C=10, kernel="rbf", gamma="scale", probability=True, random_state=SEED)
+    svm_final.fit(svm_X, svm_y)
+    log.info(f"  ✓ SVM done in {time.time()-svm_t0:.1f}s")
+
+    # --- Model A: CNN (all data) ---
+    log.info("  Training CNN (all subjects)...")
+    cnn_t0 = time.time()
+    # Build dataset from raw epochs
+    all_epoch_data = []
+    all_epoch_labels_cnn = []
+    for sid in subject_ids:
+        label = all_subjects[sid]["label"]
+        for ep in all_subjects[sid]["epochs"]:
+            all_epoch_data.append(ep)
+            all_epoch_labels_cnn.append(label)
+    cnn_dataset = EEGEpochDataset(all_epoch_data, all_epoch_labels_cnn)
+    cnn_loader = DataLoader(cnn_dataset, batch_size=CNN_BATCH, shuffle=True,
+                            num_workers=0, pin_memory=(DEVICE.type == "cuda"))
+    cnn_final = EEGNet(n_channels=all_epoch_data[0].shape[0]).to(DEVICE)
+    optimizer = torch.optim.AdamW(cnn_final.parameters(), lr=CNN_LR, weight_decay=1e-4)
+    criterion = nn.BCEWithLogitsLoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CNN_EPOCHS)
+    cnn_final.train()
+    for epoch in range(CNN_EPOCHS):
+        for xb, yb in cnn_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            optimizer.zero_grad()
+            loss = criterion(cnn_final(xb).squeeze(1), yb)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+    log.info(f"  ✓ CNN done in {time.time()-cnn_t0:.1f}s")
+
+    # --- Save final models ---
+    final_dir = MODELS_DIR / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    torch.save(cnn_final.state_dict(), final_dir / "cnn_final.pt")
+    xgb_final.save_model(str(final_dir / "xgboost_final.json"))
+    with open(final_dir / "svm_and_scaler_final.pkl", "wb") as f:
+        pickle.dump({"svm": svm_final, "scaler": scaler}, f)
+
+    log.info(f"  ✓ Final models saved to: {final_dir}")
+    log.info("    Files: cnn_final.pt, xgboost_final.json, svm_and_scaler_final.pkl")
+    log.info("=" * 60)
+
+
 def main():
     log.info("=" * 60)
     log.info("EEG DEPRESSION DETECTION — V3 ENSEMBLE TRAINING")
@@ -1110,7 +1330,10 @@ def main():
         sys.exit(1)
 
     # Run LOSO CV
-    results = run_loso_cv(all_subjects)
+    results, subject_features, subject_features_aug = run_loso_cv(all_subjects)
+
+    # Train deployable final models on all subjects
+    train_final_model(all_subjects, subject_features, subject_features_aug)
 
     elapsed = time.time() - t_start
     minutes = elapsed / 60
@@ -1121,8 +1344,12 @@ def main():
     log.info("=" * 60)
     log.info(f"✓ Total runtime: {hours:.1f}h ({minutes:.1f}m / {elapsed:.0f}s)")
     log.info(f"✓ Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    log.info(f"✓ Results: {OUTPUT_DIR / 'results_best.json'}")
-    log.info(f"✓ Logs:    {OUTPUT_DIR / 'training_v3.log'}")
+    log.info(f"✓ Results:       {OUTPUT_DIR / 'results_best.json'}")
+    log.info(f"✓ Partial log:   {OUTPUT_DIR / 'results_partial.json'}")
+    log.info(f"✓ Final models:  {MODELS_DIR / 'final'}")
+    log.info(f"✓ Fold models:   {MODELS_DIR}")
+    log.info(f"✓ Checkpoints:   {CHECKPOINT_DIR}")
+    log.info(f"✓ Logs:          {OUTPUT_DIR / 'training_v3.log'}")
     log.info("=" * 60)
 
     return results
