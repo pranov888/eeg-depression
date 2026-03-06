@@ -19,12 +19,14 @@ import warnings
 import gc
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime
 
 import numpy as np
 import mne
 import pywt
 from scipy import signal, stats
 from scipy.signal import coherence as scipy_coherence
+from tqdm import tqdm
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -216,17 +218,19 @@ def segment_epochs(data: np.ndarray, epoch_samples: int, overlap: float):
 def load_all_data():
     """Load all EDF files, segment into epochs, return structured data."""
     log.info("=" * 60)
-    log.info("LOADING DATA")
+    log.info("PHASE 1: DATA LOADING")
     log.info("=" * 60)
+    phase_start = time.time()
 
     edf_files = sorted(DATA_DIR.glob("*.edf"))
     log.info(f"Found {len(edf_files)} EDF files in {DATA_DIR}")
+    log.info(f"Data directory: {DATA_DIR}")
 
     # subject_id -> {label, epochs: list of (n_epochs, n_channels, epoch_samples)}
     subject_data = defaultdict(lambda: {"label": None, "epochs": [], "conditions": []})
     skipped = 0
 
-    for fpath in edf_files:
+    for fpath in tqdm(edf_files, desc="Loading EDF files", unit="file"):
         parsed = parse_edf_filename(fpath.name)
         if parsed is None:
             skipped += 1
@@ -244,7 +248,8 @@ def load_all_data():
             subject_data[subject_id]["label"] = label
             subject_data[subject_id]["epochs"].append(epochs)
             subject_data[subject_id]["conditions"].append(condition)
-            log.info(f"  {fpath.name}: {len(epochs)} epochs")
+            # Log per-file details
+            tqdm.write(f"    {fpath.name}: {len(epochs)} epochs ({data.shape[1]/TARGET_SR:.1f}s raw data)")
         except Exception as e:
             log.warning(f"  Failed to load {fpath.name}: {e}")
             skipped += 1
@@ -262,10 +267,19 @@ def load_all_data():
     n_mdd = sum(1 for v in all_subjects.values() if v["label"] == 1)
     n_h = sum(1 for v in all_subjects.values() if v["label"] == 0)
     total_epochs = sum(v["epochs"].shape[0] for v in all_subjects.values())
-
-    log.info(f"\nLoaded {len(all_subjects)} subjects: {n_mdd} MDD, {n_h} Healthy")
-    log.info(f"Total epochs: {total_epochs}")
-    log.info(f"Skipped files: {skipped}")
+    avg_epochs_per_subject = total_epochs / len(all_subjects) if all_subjects else 0
+    total_data_memory = sum(v["epochs"].nbytes / 1e9 for v in all_subjects.values())
+    
+    phase_time = time.time() - phase_start
+    log.info(f"\n{'─'*60}")
+    log.info(f"Data Loading Summary:")
+    log.info(f"  Total subjects:        {len(all_subjects)} ({n_mdd} MDD, {n_h} Healthy)")
+    log.info(f"  Total epochs:          {total_epochs:,}")
+    log.info(f"  Avg epochs/subject:    {avg_epochs_per_subject:.0f}")
+    log.info(f"  Total data size:       {total_data_memory:.2f} GB")
+    log.info(f"  Skipped files:         {skipped}")
+    log.info(f"  Phase duration:        {phase_time:.1f}s")
+    log.info(f"{'─'*60}\n")
 
     return all_subjects
 
@@ -359,10 +373,10 @@ def extract_all_features(epoch: np.ndarray):
     return np.concatenate([spectral, temporal, wavelet, connectivity])
 
 
-def extract_features_batch(epochs: np.ndarray):
+def extract_features_batch(epochs: np.ndarray, desc: str = "Extracting features"):
     """Extract features for a batch of epochs. epochs: (n_epochs, n_channels, n_samples)."""
     features = []
-    for i in range(len(epochs)):
+    for i in tqdm(range(len(epochs)), desc=desc, unit="epoch", leave=False):
         feat = extract_all_features(epochs[i])
         features.append(feat)
     return np.array(features, dtype=np.float32)
@@ -459,8 +473,11 @@ class EEG1DCNN(nn.Module):
         return x
 
 
-def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
+def train_cnn(train_epochs, train_labels, val_epochs, val_labels, fold_idx=None):
     """Train 1D-CNN model. Returns trained model."""
+    fold_str = f" (Fold {fold_idx})" if fold_idx is not None else ""
+    log.debug(f"  CNN Training{fold_str}: {len(train_epochs)} train epochs, {len(val_epochs)} val epochs")
+    
     model = EEG1DCNN().to(DEVICE)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=CNN_LR, weight_decay=0.01)
@@ -484,11 +501,17 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
     best_val_loss = float("inf")
     patience_counter = 0
     best_state = None
+    
+    # Tracking for logging
+    train_losses = []
+    val_losses = []
 
     for epoch in range(CNN_EPOCHS):
         # Train
         model.train()
         train_loss = 0.0
+        train_batches = 0
+        
         for X_batch, y_batch in train_loader:
             X_batch = X_batch.to(DEVICE)
             y_batch = y_batch.to(DEVICE).unsqueeze(1)
@@ -510,6 +533,7 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
             train_loss += loss.item() * len(X_batch)
+            train_batches += 1
             
             # Cleanup intermediate tensors
             del X_batch, y_batch, logits, loss
@@ -518,10 +542,12 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
 
         scheduler.step()
         train_loss /= len(train_ds)
+        train_losses.append(train_loss)
 
         # Validate
         model.eval()
         val_loss = 0.0
+        val_batches = 0
         with torch.no_grad():
             for X_batch, y_batch in val_loader:
                 X_batch = X_batch.to(DEVICE)
@@ -534,15 +560,21 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
                     logits = model(X_batch)
                     loss = criterion(logits, y_batch)
                 val_loss += loss.item() * len(X_batch)
+                val_batches += 1
                 
                 # Cleanup
                 del X_batch, y_batch, logits, loss
         
         val_loss /= len(val_ds)
+        val_losses.append(val_loss)
         
         # Cleanup GPU cache after epoch
         if DEVICE.type == "cuda":
             torch.cuda.empty_cache()
+
+        # Log training progress
+        lr = optimizer.param_groups[0]["lr"]
+        log.debug(f"    Epoch {epoch+1:2d}/{CNN_EPOCHS}: Loss={train_loss:.4f} | ValLoss={val_loss:.4f} | LR={lr:.5f}")
 
         # Early stopping
         if val_loss < best_val_loss - 1e-4:
@@ -552,12 +584,18 @@ def train_cnn(train_epochs, train_labels, val_epochs, val_labels):
         else:
             patience_counter += 1
             if patience_counter >= CNN_PATIENCE:
+                log.debug(f"    Early stopping at epoch {epoch+1} (patience={CNN_PATIENCE})")
                 break
 
     # Load best model
     if best_state is not None:
         model.load_state_dict(best_state)
     model.to(DEVICE)
+    
+    # Log final CNN training stats
+    final_train_loss = train_losses[-1] if train_losses else 0
+    final_val_loss = val_losses[-1] if val_losses else 0
+    log.debug(f"  CNN Training Complete: final_train_loss={final_train_loss:.4f}, final_val_loss={final_val_loss:.4f}, epochs={len(train_losses)}")
     
     # Cleanup memory after training
     cleanup_gpu_memory()
@@ -635,7 +673,7 @@ def run_loso_cv(all_subjects: dict):
     - Augment raw EEG for CNN only (fast numpy ops, no feature extraction)
     """
     log.info("\n" + "=" * 60)
-    log.info("LOSO CROSS-VALIDATION — ENSEMBLE (CNN + XGBoost + SVM)")
+    log.info("PHASE 2: LEAVE-ONE-SUBJECT-OUT CROSS-VALIDATION")
     log.info("=" * 60)
     log.info(f"Device: {DEVICE}")
     if DEVICE.type == "cuda":
@@ -646,29 +684,38 @@ def run_loso_cv(all_subjects: dict):
 
     subject_ids = sorted(all_subjects.keys())
     n_subjects = len(subject_ids)
+    log.info(f"Total subjects: {n_subjects}")
 
     # ---- Pre-extract features for ALL subjects ONCE ----
-    log.info("\nExtracting handcrafted features for all subjects...")
+    log.info("\n[Step 1/5] Extracting handcrafted features for all subjects...")
     t0 = time.time()
     subject_features = {}
-    for idx, sid in enumerate(subject_ids):
+    
+    total_feature_epochs = sum(len(all_subjects[sid]["epochs"]) for sid in subject_ids)
+    
+    for idx, sid in enumerate(tqdm(subject_ids, desc="Feature extraction by subject", unit="subject")):
         epochs = all_subjects[sid]["epochs"]
-        feats = extract_features_batch(epochs)
+        feats = extract_features_batch(epochs, desc=f"  {sid}")
         subject_features[sid] = feats
-        log.info(f"  [{idx+1}/{n_subjects}] {sid}: {feats.shape[0]} epochs, {feats.shape[1]} features")
+        log.debug(f"  [{idx+1}/{n_subjects}] {sid}: {feats.shape[0]} epochs, {feats.shape[1]} features, {feats.nbytes/1e6:.1f}MB")
 
     feat_dim = subject_features[subject_ids[0]].shape[1]
-    log.info(f"Feature extraction done in {time.time() - t0:.1f}s. Feature dim: {feat_dim}")
+    feat_time = time.time() - t0
+    log.info(f"✓ Feature extraction complete in {feat_time:.1f}s ({total_feature_epochs:,} epochs processed)")
+    log.info(f"  Feature dimension: {feat_dim}")
+    log.info(f"  Average {total_feature_epochs/feat_time:.0f} epochs/sec")
 
     # ---- Pre-compute augmented features (feature-space augmentation) ----
-    log.info("\nAugmenting features in feature-space (fast)...")
+    log.info("\n[Step 2/5] Augmenting features (feature-space augmentation)...")
     t0 = time.time()
     rng = np.random.RandomState(SEED)
     subject_features_aug = {}
-    for sid in subject_ids:
+    for sid in tqdm(subject_ids, desc="Feature augmentation", unit="subject"):
         aug = augment_features(subject_features[sid], rng)
         subject_features_aug[sid] = aug
-    log.info(f"Feature augmentation done in {time.time() - t0:.1f}s")
+    
+    aug_time = time.time() - t0
+    log.info(f"✓ Feature augmentation complete in {aug_time:.1f}s")
 
     # Storage for predictions
     all_epoch_labels = []
@@ -681,10 +728,14 @@ def run_loso_cv(all_subjects: dict):
     subject_true = {}
     subject_pred_prob = {}
 
-    log.info(f"\nStarting {n_subjects}-fold LOSO CV...")
+    log.info(f"\n[Step 3/5] Running {n_subjects}-fold LOSO CV...")
+    log.info("=" * 60)
+    
     total_t0 = time.time()
+    fold_times = []
+    model_times = {"cnn": [], "xgb": [], "svm": []}
 
-    for fold_idx, test_sid in enumerate(subject_ids):
+    for fold_idx, test_sid in enumerate(tqdm(subject_ids, desc="LOSO CV Progress", unit="fold")):
         fold_t0 = time.time()
         test_label = all_subjects[test_sid]["label"]
         test_epochs = all_subjects[test_sid]["epochs"]
@@ -734,11 +785,17 @@ def run_loso_cv(all_subjects: dict):
 
         try:
             # --- Model A: 1D-CNN ---
+            cnn_t0 = time.time()
             cnn_model = train_cnn(
                 train_epochs_all, train_epoch_labels_all,
                 test_epochs, np.full(len(test_epochs), test_label, dtype=np.float32),
+                fold_idx=fold_idx+1
             )
             cnn_probs = predict_cnn(cnn_model, test_epochs)
+            cnn_time = time.time() - cnn_t0
+            model_times["cnn"].append(cnn_time)
+            
+            log.debug(f"    CNN: {cnn_time:.1f}s")
             del cnn_model
             if DEVICE.type == "cuda":
                 torch.cuda.empty_cache()
@@ -748,6 +805,7 @@ def run_loso_cv(all_subjects: dict):
             gc.collect()
 
             # --- Model B: XGBoost ---
+            xgb_t0 = time.time()
             n_pos = np.sum(train_feat_labels_all == 1)
             n_neg = np.sum(train_feat_labels_all == 0)
             scale_pos = n_neg / (n_pos + 1e-8)
@@ -766,16 +824,23 @@ def run_loso_cv(all_subjects: dict):
             )
             xgb_model.fit(train_feats_scaled, train_feat_labels_all.astype(int))
             xgb_probs = xgb_model.predict_proba(test_feats_scaled)[:, 1]
+            xgb_time = time.time() - xgb_t0
+            model_times["xgb"].append(xgb_time)
+            log.debug(f"    XGBoost: {xgb_time:.1f}s")
 
             # --- Model C: SVM ---
+            svm_t0 = time.time()
             svm_model = SVC(C=10, kernel="rbf", gamma="scale", probability=True,
                             random_state=SEED)
             svm_model.fit(train_feats_scaled, train_feat_labels_all.astype(int))
             svm_probs = svm_model.predict_proba(test_feats_scaled)[:, 1]
+            svm_time = time.time() - svm_t0
+            model_times["svm"].append(svm_time)
+            log.debug(f"    SVM: {svm_time:.1f}s")
 
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                log.error(f"  FOLD {fold_idx + 1}/{n_subjects} OOM: {test_sid}")
+                log.error(f"  Fold {fold_idx + 1}/{n_subjects} OOM on {test_sid}")
                 log.error(f"  Error: {e}")
                 log.error("  Attempting recovery...")
                 cleanup_gpu_memory()
@@ -806,31 +871,46 @@ def run_loso_cv(all_subjects: dict):
         all_epoch_subject_ids.extend([test_sid] * n_test)
 
         fold_time = time.time() - fold_t0
+        fold_times.append(fold_time)
         elapsed = time.time() - total_t0
-        eta = (elapsed / (fold_idx + 1)) * (n_subjects - fold_idx - 1)
+        folds_remaining = n_subjects - fold_idx - 1
+        avg_fold_time = elapsed / (fold_idx + 1)
+        eta = avg_fold_time * folds_remaining
 
-        status = "CORRECT" if subj_pred == test_label else "WRONG"
+        status = "✓" if subj_pred == test_label else "✗"
         label_str = "MDD" if test_label == 1 else "H"
         pred_str = "MDD" if subj_pred == 1 else "H"
         
         gpu_mem = get_gpu_memory_usage()
+        
+        # Log fold completion
         log.info(
             f"  Fold {fold_idx + 1:2d}/{n_subjects}: {test_sid:10s} "
             f"True={label_str:3s} Pred={pred_str:3s} "
             f"prob={subj_prob:.3f} "
-            f"(CNN={np.mean(cnn_probs):.3f} XGB={np.mean(xgb_probs):.3f} SVM={np.mean(svm_probs):.3f}) "
-            f"[{status}] {fold_time:.0f}s (ETA: {eta/60:.0f}min) GPU: {gpu_mem:.0f}MB"
+            f"({fold_time:.0f}s, ETA={eta/60:.0f}m) "
+            f"[{status}] GPU={gpu_mem:.0f}MB"
+        )
+        log.debug(
+            f"    Model probs - CNN={np.mean(cnn_probs):.3f}, "
+            f"XGB={np.mean(xgb_probs):.3f}, SVM={np.mean(svm_probs):.3f}"
         )
         
         # === MEMORY CLEANUP === (CRITICAL FOR LARGE CV)
         if CLEAR_GPU_CACHE_BETWEEN_FOLDS:
             cleanup_gpu_memory()
-            log.debug(f"  Memory cleaned. Current GPU: {get_gpu_memory_usage():.0f}MB")
+            log.debug(f"    Post-cleanup GPU memory: {get_gpu_memory_usage():.0f}MB")
+
+    log.info("=" * 60)
+    log.info(f"✓ LOSO CV Complete in {time.time() - total_t0:.1f}s")
+    log.info(f"  Avg fold time: {np.mean(fold_times):.1f}s")
+    log.info(f"  Total folds: {len(fold_times)}")
 
     return compute_and_report_metrics(
         all_epoch_labels, all_epoch_probs_ensemble,
         all_epoch_probs_cnn, all_epoch_probs_xgb, all_epoch_probs_svm,
         all_epoch_subject_ids, subject_true, subject_pred_prob,
+        model_times=model_times,
     )
 
 
@@ -842,8 +922,13 @@ def compute_and_report_metrics(
     epoch_labels, epoch_probs_ensemble,
     epoch_probs_cnn, epoch_probs_xgb, epoch_probs_svm,
     epoch_subject_ids, subject_true, subject_pred_prob,
+    model_times=None,
 ):
     """Compute and print all metrics."""
+    log.info("\n" + "=" * 60)
+    log.info("PHASE 3: METRICS & REPORTING")
+    log.info("=" * 60)
+    
     epoch_labels = np.array(epoch_labels)
     epoch_probs = np.array(epoch_probs_ensemble)
     epoch_preds = (epoch_probs >= 0.5).astype(int)
@@ -883,6 +968,7 @@ def compute_and_report_metrics(
     svm_acc = accuracy_score(epoch_labels, svm_preds)
 
     # Per-model subject accuracy
+    log.info("\n[Per-Model Performance]")
     for model_name, model_probs in [("CNN", epoch_probs_cnn), ("XGB", epoch_probs_xgb), ("SVM", epoch_probs_svm)]:
         model_probs = np.array(model_probs)
         model_subj_probs = {}
@@ -891,17 +977,15 @@ def compute_and_report_metrics(
             model_subj_probs[sid] = np.mean(model_probs[mask])
         model_subj_preds = np.array([(model_subj_probs[s] >= 0.5) for s in subject_ids_sorted]).astype(int)
         model_subj_acc = accuracy_score(subj_true_arr, model_subj_preds)
-        log.info(f"  {model_name} subject-level accuracy: {model_subj_acc:.4f}")
+        log.info(f"  {model_name:10s} - Subject Accuracy: {model_subj_acc:.4f} ({int(model_subj_acc * len(subj_true_arr))}/{len(subj_true_arr)})")
 
     # Misclassified subjects
     misclassified = [s for s in subject_ids_sorted if subj_pred_arr[subject_ids_sorted.index(s)] != subj_true_arr[subject_ids_sorted.index(s)]]
 
     # --- Report ---
-    log.info("\n" + "=" * 60)
-    log.info("FINAL RESULTS")
-    log.info("=" * 60)
-
-    log.info("\n--- Sample-Level Metrics ---")
+    log.info("\n" + "─" * 60)
+    log.info("SAMPLE-LEVEL METRICS (Each epoch)")
+    log.info("─" * 60)
     log.info(f"  Accuracy:    {sample_acc:.4f}")
     log.info(f"  F1 Score:    {sample_f1:.4f}")
     log.info(f"  AUC-ROC:     {sample_auc:.4f}")
@@ -909,16 +993,15 @@ def compute_and_report_metrics(
     log.info(f"  Recall:      {sample_rec:.4f}")
     log.info(f"  Sensitivity: {sample_sens:.4f}")
     log.info(f"  Specificity: {sample_spec:.4f}")
-    log.info(f"  Confusion:   TP={tp} TN={tn} FP={fp} FN={fn}")
+    log.info(f"  Confusion Matrix:")
+    log.info(f"    Predicted:  Healthy  MDD")
+    log.info(f"    Healthy:    {tn:4d}    {fp:4d}")
+    log.info(f"    MDD:        {fn:4d}    {tp:4d}")
 
-    log.info("\n--- Per-Model Sample Accuracy ---")
-    log.info(f"  CNN:     {cnn_acc:.4f}")
-    log.info(f"  XGBoost: {xgb_acc:.4f}")
-    log.info(f"  SVM:     {svm_acc:.4f}")
-    log.info(f"  Ensemble:{sample_acc:.4f}")
-
-    log.info("\n--- Subject-Level Metrics ---")
-    log.info(f"  Accuracy:    {subj_acc:.4f} ({int(subj_acc * len(subj_true_arr))}/{len(subj_true_arr)} subjects)")
+    log.info("\n" + "─" * 60)
+    log.info("SUBJECT-LEVEL METRICS (Averaged across epochs)")
+    log.info("─" * 60)
+    log.info(f"  Accuracy:    {subj_acc:.4f} ({int(subj_acc * len(subj_true_arr))}/{len(subj_true_arr)} subjects correct)")
     log.info(f"  F1 Score:    {subj_f1:.4f}")
     log.info(f"  AUC-ROC:     {subj_auc:.4f}")
     log.info(f"  Precision:   {subj_prec:.4f}")
@@ -926,19 +1009,34 @@ def compute_and_report_metrics(
     log.info(f"  Sensitivity: {subj_sens:.4f}")
     log.info(f"  Specificity: {subj_spec:.4f}")
     log.info(f"  Confusion Matrix:")
-    log.info(f"    Predicted:  H    MDD")
-    log.info(f"    True H:   {s_tn:3d}  {s_fp:3d}")
-    log.info(f"    True MDD: {s_fn:3d}  {s_tp:3d}")
+    log.info(f"    Predicted:  Healthy  MDD")
+    log.info(f"    Healthy:    {s_tn:4d}    {s_fp:4d}")
+    log.info(f"    MDD:        {s_fn:4d}    {s_tp:4d}")
 
     if misclassified:
-        log.info(f"\n  Misclassified subjects ({len(misclassified)}):")
+        log.info(f"\n  ⚠️  Misclassified subjects ({len(misclassified)}):")
         for sid in misclassified:
-            true_l = "MDD" if subject_true[sid] == 1 else "H"
+            true_l = "MDD" if subject_true[sid] == 1 else "Healthy"
+            pred_l = "MDD" if (subject_pred_prob[sid] >= 0.5) else "Healthy"
             pred_p = subject_pred_prob[sid]
-            log.info(f"    {sid}: true={true_l}, prob={pred_p:.3f}")
+            log.info(f"    {sid}: True={true_l:8s} → Pred={pred_l:8s} (prob={pred_p:.3f})")
+    else:
+        log.info(f"\n  ✓ Perfect classification! All subjects correct.")
+
+    # Model timing summary
+    if model_times:
+        log.info("\n" + "─" * 60)
+        log.info("MODEL TRAINING TIME SUMMARY")
+        log.info("─" * 60)
+        for model_name, times in model_times.items():
+            if times:
+                avg_time = np.mean(times)
+                total_time = np.sum(times)
+                log.info(f"  {model_name.upper():10s} - Avg: {avg_time:.1f}s/fold, Total: {total_time:.0f}s ({len(times)} folds)")
 
     # --- Save results ---
     results = {
+        "timestamp": datetime.now().isoformat(),
         "sample_level": {
             "accuracy": float(sample_acc),
             "f1": float(sample_f1),
@@ -947,6 +1045,7 @@ def compute_and_report_metrics(
             "recall": float(sample_rec),
             "sensitivity": float(sample_sens),
             "specificity": float(sample_spec),
+            "n_epochs": int(len(epoch_labels)),
             "confusion_matrix": {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)},
         },
         "subject_level": {
@@ -960,6 +1059,7 @@ def compute_and_report_metrics(
             "confusion_matrix": {"TP": int(s_tp), "TN": int(s_tn), "FP": int(s_fp), "FN": int(s_fn)},
             "n_subjects": len(subj_true_arr),
             "n_correct": int(subj_acc * len(subj_true_arr)),
+            "misclassified_count": len(misclassified),
             "misclassified": misclassified,
         },
         "per_model_sample_accuracy": {
@@ -977,7 +1077,7 @@ def compute_and_report_metrics(
     results_path = OUTPUT_DIR / "results_best.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
-    log.info(f"\nResults saved to {results_path}")
+    log.info(f"\n✓ Results saved to {results_path}")
 
     return results
 
@@ -988,31 +1088,42 @@ def compute_and_report_metrics(
 
 def main():
     log.info("=" * 60)
-    log.info("EEG Depression Detection — V3 Ensemble Training")
+    log.info("EEG DEPRESSION DETECTION — V3 ENSEMBLE TRAINING")
     log.info("=" * 60)
-    log.info(f"Python: {sys.version}")
-    log.info(f"PyTorch: {torch.__version__}")
-    log.info(f"CUDA available: {torch.cuda.is_available()}")
+    log.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"Python:    {sys.version.split()[0]}")
+    log.info(f"PyTorch:   {torch.__version__}")
+    log.info(f"CUDA:      {torch.cuda.is_available()}")
     if torch.cuda.is_available():
-        log.info(f"GPU: {torch.cuda.get_device_name(0)}")
-    log.info(f"Device: {DEVICE}")
-    log.info(f"Data dir: {DATA_DIR}")
-    log.info(f"Output dir: {OUTPUT_DIR}")
+        log.info(f"GPU:       {torch.cuda.get_device_name(0)}")
+    log.info(f"Device:    {DEVICE}")
+    log.info(f"Data dir:  {DATA_DIR}")
+    log.info(f"Output:    {OUTPUT_DIR}")
+    log.info("=" * 60)
 
     t_start = time.time()
 
     # Load data
     all_subjects = load_all_data()
     if len(all_subjects) == 0:
-        log.error("No subjects loaded! Check data directory.")
+        log.error("❌ No subjects loaded! Check data directory.")
         sys.exit(1)
 
     # Run LOSO CV
     results = run_loso_cv(all_subjects)
 
     elapsed = time.time() - t_start
-    log.info(f"\nTotal runtime: {elapsed / 60:.1f} minutes")
-    log.info("Done.")
+    minutes = elapsed / 60
+    hours = minutes / 60
+    
+    log.info("\n" + "=" * 60)
+    log.info("TRAINING COMPLETE")
+    log.info("=" * 60)
+    log.info(f"✓ Total runtime: {hours:.1f}h ({minutes:.1f}m / {elapsed:.0f}s)")
+    log.info(f"✓ Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"✓ Results: {OUTPUT_DIR / 'results_best.json'}")
+    log.info(f"✓ Logs:    {OUTPUT_DIR / 'training_v3.log'}")
+    log.info("=" * 60)
 
     return results
 
